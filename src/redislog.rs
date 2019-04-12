@@ -2,15 +2,29 @@ extern crate chrono;
 extern crate r2d2;
 extern crate r2d2_redis;
 extern crate redis;
+extern crate serde_json;
+extern crate slog;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use r2d2_redis::RedisConnectionManager;
 use serde_json::json;
+use slog::{OwnedKVList, Record, KV};
 use std::fmt;
 use std::process::Command;
 use std::time::Duration;
 
-/// A logger that sends JSON formatted logs to a key in a Redis instance.
+/// A logger that sends JSON formatted logs to a list in a Redis instance. It uses this format
+///
+///   {
+///     "@timestamp": ${timeRFC3339},
+///     "@source_host": ${hostname},
+///     "@message": ${message},
+///     "@fields": {
+///        "level": ${levelLowercase},
+///        "application": ${appName}
+///    }
+///
+/// It supports structured logging via [`slog`][slog-url],
 ///
 /// This struct implements the `Log` trait from the [`log` crate][log-crate-url],
 /// which allows it to act as a logger.
@@ -20,12 +34,14 @@ use std::time::Duration;
 ///
 /// [log-crate-url]: https://docs.rs/log/
 /// [`Builder`]: struct.Builder.html
+/// [slog-url]: https://github.com/slog-rs/slog
 #[derive(Debug)]
 pub struct Logger {
     config: LoggerConfig,
     pool: r2d2::Pool<RedisConnectionManager>,
 }
 
+/// Builds the Redis logger.
 #[derive(Default, Debug)]
 pub struct Builder {
     redis_host: String,
@@ -40,6 +56,7 @@ pub struct Builder {
 pub enum Error {
     ConnectionPoolErr(r2d2::Error),
     RedisErr(redis::RedisError),
+    LogErr(slog::Error),
 }
 
 #[derive(Debug)]
@@ -134,30 +151,46 @@ impl Builder {
     }
 }
 
+type KeyVals = std::vec::Vec<(String, serde_json::Value)>;
+
 impl Logger {
-    fn v0_msg(&self, record: &log::Record) -> String {
+    fn v0_msg(&self, level: String, msg: String, key_vals: Option<KeyVals>) -> String {
         let now: DateTime<Utc> = Utc::now();
         let time = now.to_rfc3339_opts(SecondsFormat::AutoSi, true);
-        let level = record.level().to_string();
         let application = self.config.app_name.clone();
-        let json_val = json!({
+        let mut json_val = json!({
             "@timestamp": time,
             "@source_host": self.config.hostname.clone(),
-            "@message": format!("{}", record.args()),
+            "@message": msg,
             "@fields": {
                 "level": level,
                 "application": application
             }
         });
+
+        let fields = match json_val {
+            serde_json::Value::Object(ref mut v) => match v.get_mut("@fields").unwrap() {
+                serde_json::Value::Object(ref mut v) => Some(v),
+                _ => None,
+            },
+            _ => None,
+        }
+            .unwrap();
+
+        for key_val in &key_vals.unwrap() {
+            fields.insert(key_val.0.clone(), key_val.1.clone());
+        }
+
         json_val.to_string()
     }
 
-    fn send_to_redis(&self, record: &log::Record) -> Result<(), Error> {
+    /// Sends a message constructed by v0_msg to the redis server
+    fn send_to_redis(&self, msg: &String) -> Result<(), Error> {
         let con = self.pool.get()?;
 
         redis::cmd("RPUSH")
             .arg(self.config.redis_key.clone())
-            .arg(self.v0_msg(record))
+            .arg(msg)
             .query(&*con)?;
 
         if let Some(t) = self.config.ttl_seconds {
@@ -177,9 +210,9 @@ impl log::Log for Logger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            let msg = self.v0_msg(record);
+            let msg = self.v0_msg(record.level().to_string(), format!("{}", record.args()), None);
             let mut prefix = String::from("");
-            if let Err(e) = self.send_to_redis(record) {
+            if let Err(e) = self.send_to_redis(&msg) {
                 prefix = format!("fallback logger: [{}]", e);
             }
             println!("{}{}", prefix, msg);
@@ -201,11 +234,89 @@ impl From<redis::RedisError> for Error {
     }
 }
 
+impl From<slog::Error> for Error {
+    fn from(error: slog::Error) -> Self {
+        Error::LogErr(error)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::ConnectionPoolErr(_e) => write!(f, "Redis logger error!"),
-            Error::RedisErr(_e) => write!(f, "Redis logger error!"),
+            Error::ConnectionPoolErr(_e) => write!(f, "Redis logger connection pool error"),
+            Error::RedisErr(_e) => write!(f, "Redis logger Redis error"),
+            Error::LogErr(_e) => write!(f, "redis logger slog error"),
         }
+    }
+}
+
+impl slog::Drain for Logger {
+    type Ok = ();
+    type Err = self::Error;
+
+    fn log(&self, record: &Record, values: &OwnedKVList) -> Result<Self::Ok, Self::Err> {
+        let level_str = record.level().to_string();
+        let ser = &mut Serializer::new();
+        record.kv().serialize(record, ser)?;
+        values.serialize(record, ser)?;
+
+        //let keyVals = vec![("Hallo".to_string(), serde_json::Value::String("world!".to_string()))];
+        let msg = self.v0_msg(level_str, format!("{}", record.msg()), Some(ser.done()));
+        self.send_to_redis(&msg)?;
+        Ok(())
+    }
+}
+
+struct Serializer {
+    vec: KeyVals,
+}
+
+impl Serializer {
+    pub fn new() -> Serializer {
+        Serializer { vec: Vec::new() }
+    }
+
+    pub fn emit_val(&mut self, key: slog::Key, val: serde_json::Value) -> slog::Result {
+        self.vec.push((key.to_string(), val));
+        Ok(())
+    }
+
+    fn emit_serde_json_number<V>(&mut self, key: Key, value: V) -> slog::Result
+        where
+            serde_json::Number: From<V>,
+    {
+        // convert a given number into serde_json::Number
+        let num = serde_json::Number::from(value);
+        self.emit_val(key, serde_json::Value::Number(num))
+    }
+
+    fn done(&mut self) -> KeyVals {
+        self.vec.clone()
+    }
+}
+
+use core::fmt::Write;
+use slog::Key;
+
+#[allow(dead_code)]
+impl slog::Serializer for Serializer {
+    // TODO: Implement other methods
+
+    fn emit_bool(&mut self, key: Key, val: bool) -> slog::Result {
+        self.emit_val(key, serde_json::Value::Bool(val))
+    }
+
+    fn emit_unit(&mut self, key: Key) -> slog::Result {
+        self.emit_val(key, serde_json::Value::Null)
+    }
+
+    fn emit_str(&mut self, key: Key, val: &str) -> slog::Result {
+        self.emit_val(key, serde_json::Value::String(val.to_string()))
+    }
+
+    fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
+        let mut buf = String::with_capacity(128);
+        buf.write_fmt(*val).unwrap();
+        self.emit_val(key, serde_json::Value::String(buf))
     }
 }
